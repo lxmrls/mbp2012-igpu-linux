@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=dGPU Tray
+Comment=Discrete GPU power indicator and toggle
+Exec=python3 /home/alex/.local/bin/dgpu-tray.py
+X-GNOME-Autostart-Delay=8
+X-GNOME-Autostart-enabled=true
+NoDisplay=false

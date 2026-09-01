@@ -1,0 +1,24 @@
+#!/bin/sh
+# Report/control the discrete GPU power. The iGPU always drives the panel;
+# this only powers the dGPU rail on/off (mux stays on Intel). Root-only:
+# reads/writes /sys/kernel/debug/vgaswitcheroo (debugfs is root-readable).
+SW=/sys/kernel/debug/vgaswitcheroo/switch
+DEV=/sys/bus/pci/devices/0000:01:00.0
+case "$1" in
+  status)
+    if [ -r "$SW" ]; then
+      act=$(grep '+' "$SW" | grep -o 'IGD\|DIS')
+      case "$(grep '^1:DIS' "$SW")" in *:Off*) d=off ;; *) d=on ;; esac
+      echo "active=${act:-?} dgpu=$d"
+    else
+      echo "active=? dgpu=?"
+    fi ;;
+  on)
+    echo ON > "$SW"; echo "dgpu=on" ;;
+  off)
+    grep -q 'IGD:+' "$SW" || { echo "refuse: iGPU not the active GPU"; exit 1; }
+    echo auto > "$DEV/power/control" 2>/dev/null
+    echo OFF > "$SW"; echo "dgpu=off" ;;
+  *)
+    echo "usage: dgpu-ctl status|on|off"; exit 2 ;;
+esac
