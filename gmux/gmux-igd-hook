@@ -1,0 +1,91 @@
+#!/bin/sh
+# gmux-igd-hook — run by the `install` rules in /etc/modprobe.d/gmux-igd.conf.
+#
+# Purpose: make Ubuntu boot on the Intel iGPU regardless of the firmware's
+# gpu-power-prefs NVRAM variable (which macOS resets). Apple's EFI leaves the
+# display mux on the NVIDIA GPU; i915 can only detect the eDP panel at probe
+# time, so the mux must be flipped BEFORE i915 loads. After both GPU drivers
+# are bound, vga_switcheroo is asked to switch to IGD, which powers the dGPU
+# off through nouveau's own suspend path (the same as `echo OFF` did before).
+#
+#   gmux-igd-hook i915 [opts]     flip mux -> IGD, load apple_gmux + i915, load
+#                                 nouveau, then switch-if-ready
+#   gmux-igd-hook nouveau [opts]  load nouveau under a lock, then switch-if-ready
+#
+# Kernel cmdline escape hatches:
+#   nomodeset / i915.modeset=0 / gmux_noflip  -> do nothing but load the module
+#   dgpu_keep_on                              -> flip the mux, leave the dGPU on
+#                                               (external monitor mode)
+GMUXCTL=/usr/local/sbin/gmuxctl
+LOCK=/run/lock/gmux-igd.lock
+SW=/sys/kernel/debug/vgaswitcheroo/switch
+DGPU=/sys/bus/pci/devices/0000:01:00.0
+IGPU=/sys/bus/pci/devices/0000:00:02.0
+CMDLINE=" $(cat /proc/cmdline 2>/dev/null) "
+
+log() { echo "gmux-igd-hook: $*" > /dev/kmsg 2>/dev/null || echo "gmux-igd-hook: $*" >&2; }
+has() { case "$CMDLINE" in *" $1 "*) return 0;; esac; return 1; }
+flip_allowed() {
+    has nomodeset && return 1
+    has gmux_noflip && return 1
+    case "$CMDLINE" in *"i915.modeset=0"*) return 1;; esac
+    return 0
+}
+
+try_switch() {
+    echo auto > "$DGPU/power/control" 2>/dev/null
+    echo IGD > "$SW" 2>/dev/null
+}
+
+switch_if_ready() {
+    flip_allowed || return 0
+    if has dgpu_keep_on; then log "dgpu_keep_on: leaving dGPU powered"; return 0; fi
+    if [ ! -e "$IGPU/driver" ] || [ ! -e "$DGPU/driver" ]; then
+        log "switch: GPU drivers not both bound yet"; return 0
+    fi
+    mountpoint -q /sys/kernel/debug || mount -t debugfs debugfs /sys/kernel/debug 2>/dev/null
+    i=0
+    while [ ! -e "$SW" ] && [ $i -lt 50 ]; do sleep 0.1; i=$((i+1)); done
+    if [ ! -e "$SW" ]; then log "switch: $SW never appeared"; return 0; fi
+    if grep -q 'IGD:+' "$SW"; then log "switch: IGD already active"; return 0; fi
+    if try_switch; then log "vga_switcheroo: switched to IGD, dGPU powered off"; return 0; fi
+    log "vga_switcheroo: switch to IGD refused (DRM device busy?)"
+    # Plymouth may hold a DRM fd; ask it to release the display and retry once.
+    if command -v plymouth >/dev/null 2>&1 && plymouth --ping 2>/dev/null; then
+        plymouth deactivate 2>/dev/null; sleep 0.3
+        if try_switch; then log "vga_switcheroo: switched to IGD after plymouth deactivate"
+        else log "vga_switcheroo: switch still refused; dGPU stays on"; fi
+        plymouth reactivate 2>/dev/null
+    fi
+    return 0
+}
+
+mode="$1"; shift
+case "$mode" in
+    i915)
+        if flip_allowed; then
+            if out=$("$GMUXCTL" igd 2>&1); then log "mux -> IGD before i915 probe ($out)"
+            else log "gmuxctl igd FAILED: $out"; fi
+        else
+            log "mux flip disabled by kernel cmdline"
+        fi
+        modprobe apple_gmux 2>/dev/null
+        modprobe --ignore-install i915 "$@"
+        rc=$?
+        if flip_allowed; then modprobe nouveau 2>/dev/null; fi
+        ( flock -x 9; switch_if_ready ) 9>"$LOCK"
+        exit $rc
+        ;;
+    nouveau)
+        ( flock -x 9
+          modprobe --ignore-install nouveau "$@"
+          rc=$?
+          switch_if_ready
+          exit $rc ) 9>"$LOCK"
+        ;;
+    switch)
+        ( flock -x 9; switch_if_ready ) 9>"$LOCK"
+        ;;
+    *)
+        echo "usage: gmux-igd-hook i915|nouveau|switch [modprobe opts]" >&2; exit 2 ;;
+esac

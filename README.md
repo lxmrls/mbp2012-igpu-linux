@@ -44,9 +44,13 @@ Port A VBT info: ... DP:1 eDP:1
 [CONNECTOR:79:eDP-2][ENCODER:78:DP A] Link Training passed at link rate = 270000, lane count = 4
 ```
 
-Then the display mux must be routed to Intel at boot, which is done with the Apple
-`gpu-power-prefs` NVRAM variable (set once from macOS — Linux cannot write it). With the mux on
-Intel and the VBT loaded, the iGPU drives the panel and the dGPU can be powered off.
+The second half of the problem is the display **mux**. Apple's firmware routes the panel to
+the NVIDIA GPU unless the `gpu-power-prefs` NVRAM variable says otherwise, that variable can
+only be written from macOS, and macOS rewrites it on every boot — so a setup that depends on
+it breaks the first time you boot macOS. This repo instead flips the mux **from Linux**: a
+`modprobe` install hook (`gmux/`) switches the gmux to Intel immediately before `i915` loads,
+so `i915` finds the panel at probe time, and then powers the dGPU off through `vga_switcheroo`.
+No macOS step, and nothing macOS can undo.
 
 ## Repo contents
 
@@ -55,24 +59,26 @@ Intel and the VBT loaded, the iGPU drives the panel and the dGPU can be powered 
 | `vbt/vbt.bin` | The ready-to-use VBT (drop into `/lib/firmware/i915/`) |
 | `vbt/mkvbt.py` | Generator that reproduces `vbt.bin` byte-for-byte |
 | `vbt/panel.edid` | The panel EDID the timings came from |
+| `gmux/gmuxctl.c` | Tiny static tool that drives the Apple gmux mux registers (status / igd / dis) |
+| `gmux/gmux-igd-hook` | modprobe install hook: mux→Intel before `i915`, then dGPU off after both drivers bind |
+| `gmux/gmux-igd.conf` | `/etc/modprobe.d` rules that route `i915` and `nouveau` loads through the hook |
 | `tray/dgpu-ctl` | Root helper: report / power the dGPU on/off |
 | `tray/dgpu-tray.py` | GNOME AppIndicator **status** applet (read-only) |
 | `scripts/install.sh` | Installs the VBT, GRUB entries, off-by-default service, and applet |
 
 ## Install
 
-1. **From macOS**, route the panel to the iGPU (one time):
-   ```
-   sudo nvram fa4ce28d-b62f-4c99-9cc3-6815686e30f9:gpu-power-prefs=%01%00%00%00
-   ```
-2. **From Linux**, run the installer:
+1. Run the installer (Ubuntu / Debian-style system with `initramfs-tools` and GRUB):
    ```
    git clone https://github.com/lxmrls/mbp2012-igpu-linux
    cd mbp2012-igpu-linux
    sudo bash scripts/install.sh
    ```
-3. Reboot. The default GRUB entry runs the iGPU with the dGPU off. Pick
+2. Reboot. The default GRUB entry runs the iGPU with the dGPU off. Pick
    **"Ubuntu (External Display — dGPU on)"** when you want an external monitor.
+
+No macOS step is required. (If you had previously set `gpu-power-prefs` from macOS, it is
+harmless either way — the hook just finds the mux already on Intel.)
 
 Verify: `glxinfo -B | grep renderer` should say **Mesa Intel(R) HD Graphics 4000**, and
 `sudo cat /sys/kernel/debug/vgaswitcheroo/switch` should show `IGD:+` and `DIS: :Off`.
@@ -83,6 +89,39 @@ Verify: `glxinfo -B | grep renderer` should say **Mesa Intel(R) HD Graphics 4000
 - **External monitor:** boot the **External Display** entry, then plug in. The HDMI / DisplayPort /
   Thunderbolt ports are wired to the NVIDIA GPU, so they need it powered.
 - **Tray applet:** read-only status (render GPU, dGPU state, external monitor, CPU temp).
+
+## How the boot-time mux flip works
+
+`i915` only creates the eDP connector if it can talk to the panel while it probes, so the mux
+has to be on Intel *before* the driver loads. On Ubuntu the GPU drivers are loaded from the
+root filesystem by udev a few seconds into boot (not from the initramfs), which makes a
+`modprobe` **install rule** the right hook point:
+
+```
+install i915    /usr/local/sbin/gmux-igd-hook i915    $CMDLINE_OPTS
+install nouveau /usr/local/sbin/gmux-igd-hook nouveau $CMDLINE_OPTS
+```
+
+The hook: flips the gmux (DDC/AUX, display, external) to Intel with `gmuxctl igd` → loads
+`apple_gmux` and `i915` → loads `nouveau` → once both drivers are bound, writes `IGD` to
+`vga_switcheroo`, which switches and suspends the dGPU through nouveau's own power path. It
+runs inside the `i915` udev event, before Plymouth can grab the DRM device (and deactivates
+Plymouth and retries if the switch is refused as busy).
+
+Kernel command-line switches:
+
+| Flag | Effect |
+|------|--------|
+| `nomodeset`, `i915.modeset=0`, `gmux_noflip` | Don't touch the mux (recovery mode boots exactly as before) |
+| `dgpu_keep_on` | Flip the mux but leave the dGPU powered (the External Display entry) |
+
+Diagnose with `dmesg | grep gmux-igd-hook`. Two harmless kernel warnings appear at boot: one
+from `i915` (`vbt_get_panel_type`, because the VBT deliberately has no LFP block) and one from
+nouveau's display engine timing out while being suspended.
+
+**Other distros:** the hook assumes the GPU drivers load from the root filesystem. If your
+initramfs does early KMS (Arch/Fedora with `i915` in the initramfs modules list), copy
+`gmuxctl` and the hook into the initramfs too, or drop `i915` from early KMS.
 
 ## Known limitations
 
@@ -95,9 +134,11 @@ These are hardware / nouveau realities, not bugs in this setup:
   (nouveau's Kepler HDMI SCDC path fails at 4K, `ret:-22`). Use DP for 4K.
 - **No CUDA / no dGPU compute.** nouveau only; the proprietary driver (390) won't build on
   modern kernels. The dGPU's only real use here is external displays.
-- **Recovery:** if the internal panel ever comes up black, boot with the mux back on the dGPU by
-  clearing the NVRAM var from macOS (`sudo nvram -d fa4ce28d-...:gpu-power-prefs`). Keep a live
-  USB handy the first time.
+- **Recovery:** if the internal panel ever comes up black, pick the GRUB *recovery mode* entry
+  (or add `gmux_noflip`) — the hook then leaves the mux alone and the machine boots on the
+  NVIDIA GPU as stock. Uninstall the flip entirely with `sudo rm /etc/modprobe.d/gmux-igd.conf`.
+  Note that with the panel on nouveau, this model green-screens at boot fairly often on its own
+  (nouveau `core notifier timeout`); that is the stock behaviour, not this setup.
 
 ## Credits
 
