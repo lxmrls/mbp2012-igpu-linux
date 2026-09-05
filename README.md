@@ -63,7 +63,7 @@ No macOS step, and nothing macOS can undo.
 | `gmux/gmux-igd-hook` | modprobe install hook: mux→Intel before `i915`, then dGPU off after both drivers bind |
 | `gmux/gmux-igd.conf` | `/etc/modprobe.d` rules that route `i915` and `nouveau` loads through the hook |
 | `tray/dgpu-ctl` | Root helper: report / power the dGPU on/off |
-| `tray/dgpu-tray.py` | GNOME AppIndicator **status** applet (read-only) |
+| `tray/dgpu-tray.py` | GNOME AppIndicator **status** applet (read-only for the GPU); optional battery charge-limit slider |
 | `scripts/install.sh` | Installs the VBT, GRUB entries, off-by-default service, and applet |
 
 ## Install
@@ -89,6 +89,10 @@ Verify: `glxinfo -B | grep renderer` should say **Mesa Intel(R) HD Graphics 4000
 - **External monitor:** boot the **External Display** entry, then plug in. The HDMI / DisplayPort /
   Thunderbolt ports are wired to the NVIDIA GPU, so they need it powered.
 - **Tray applet:** read-only status (render GPU, dGPU state, external monitor, CPU temp).
+  If a `/usr/local/bin/battcap` helper is present (from a separate battery charge-limit setup
+  built on [applesmc-next](https://github.com/c---/applesmc-next)), the menu also shows the
+  battery and a **Charge limit** submenu with presets, a slider and a gauge-calibration helper.
+  Without it that entry reads "unavailable" and nothing else changes.
 
 ## How the boot-time mux flip works
 
