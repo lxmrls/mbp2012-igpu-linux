@@ -13,7 +13,7 @@ Also hosts the battery "Charge limit" control (SMC BCLM via applesmc-next):
 presets 50-100% and a slider dialog. Writes go through /usr/local/bin/battcap
 (sudoers NOPASSWD), which enforces the 50-100 range as root.
 """
-import gi, glob, os, subprocess
+import gi, glob, os, subprocess, threading
 gi.require_version("Gtk", "3.0")
 gi.require_version("AyatanaAppIndicator3", "0.1")
 from gi.repository import Gtk, GLib, AyatanaAppIndicator3 as AppIndicator
@@ -95,6 +95,19 @@ def battery_state():
     if abs(soc - gauge) > 2:
         return f"{soc}% (SMC) · {st} · gauge {gauge}%"
     return f"{soc}% (SMC) · {st}"
+
+def bt_powered():
+    """Bluetooth adapter power state via bluetoothctl (unprivileged). None if no adapter."""
+    try:
+        out = subprocess.run(["bluetoothctl", "show"], capture_output=True, text=True, timeout=5).stdout
+        if "Powered: yes" in out: return True
+        if "Powered: no" in out: return False
+    except Exception:
+        pass
+    return None
+
+def bt_set(on):
+    subprocess.run(["bluetoothctl", "power", "on" if on else "off"], capture_output=True, text=True, timeout=10)
 
 def cpu_temp():
     for n in glob.glob("/sys/class/hwmon/hwmon*/name"):
@@ -261,6 +274,98 @@ class DgpuTray:
         self._sync_cap_menu()
         return True
 
+class BtTray:
+    """Second top-bar indicator: the standard Bluetooth icon, lit when the adapter is on.
+    Left-click opens a one-item menu (indicators can't act on a plain click); middle-click
+    toggles directly."""
+    ICON_ON, ICON_OFF = "bluetooth-active-symbolic", "bluetooth-disabled-symbolic"
+
+    def __init__(self):
+        self.ind = AppIndicator.Indicator.new("bt-tray", self.ICON_OFF, AppIndicator.IndicatorCategory.HARDWARE)
+        self.ind.set_status(AppIndicator.IndicatorStatus.ACTIVE)
+        self.menu = Gtk.Menu()
+        self.i_toggle = Gtk.MenuItem(label="Bluetooth"); self.i_toggle.connect("activate", self.toggle)
+        self.menu.append(self.i_toggle); self.menu.show_all()
+        self.ind.set_menu(self.menu)
+        self.ind.set_secondary_activate_target(self.i_toggle)   # middle-click = toggle
+        self.state = None
+        self.refresh()
+        GLib.timeout_add_seconds(5, self.refresh)
+
+    def toggle(self, *_):
+        if self.state is not None:
+            bt_set(not self.state)
+        GLib.timeout_add(800, lambda: (self.refresh(), False)[1])
+
+    def refresh(self):
+        st = bt_powered()
+        self.state = st
+        if st is None:
+            self.ind.set_status(AppIndicator.IndicatorStatus.PASSIVE); return True
+        self.ind.set_status(AppIndicator.IndicatorStatus.ACTIVE)
+        self.ind.set_icon_full(self.ICON_ON if st else self.ICON_OFF, "Bluetooth on" if st else "Bluetooth off")
+        self.i_toggle.set_label("Turn Bluetooth off" if st else "Turn Bluetooth on")
+        return True
+
+TB_POWER = "/usr/local/sbin/tb-power"          # root helper (sudoers NOPASSWD)
+ICON_DIR = os.path.expanduser("~/.local/share/dgpu-tray/icons")
+
+def tb_powered():
+    """True/False from the PCI bus (no root); None if the helper is missing."""
+    if not os.path.exists(TB_POWER):
+        return None
+    try:
+        out = subprocess.run([TB_POWER, "status"], capture_output=True, text=True, timeout=5).stdout.strip()
+        return out == "on"
+    except Exception:
+        return None
+
+class TbTray:
+    """Thunderbolt controller power: the Yaru bolt icon, crossed out while the controller is
+    powered off (tb-power). Left-click = one-item menu, middle-click = toggle. Powering on
+    takes a few seconds (firmware link training), so it runs off the main loop."""
+    def __init__(self):
+        self.ind = AppIndicator.Indicator.new("tb-tray", "thunderbolt-off-symbolic", AppIndicator.IndicatorCategory.HARDWARE)
+        self.ind.set_icon_theme_path(ICON_DIR)
+        self.ind.set_status(AppIndicator.IndicatorStatus.ACTIVE)
+        self.menu = Gtk.Menu()
+        self.i_toggle = Gtk.MenuItem(label="Thunderbolt"); self.i_toggle.connect("activate", self.toggle)
+        self.menu.append(self.i_toggle); self.menu.show_all()
+        self.ind.set_menu(self.menu)
+        self.ind.set_secondary_activate_target(self.i_toggle)
+        self.state = None; self.busy = False
+        self.refresh()
+        GLib.timeout_add_seconds(5, self.refresh)
+
+    def toggle(self, *_):
+        if self.state is None or self.busy:
+            return
+        want_on = not self.state
+        self.busy = True
+        self.i_toggle.set_label("Powering Thunderbolt on…" if want_on else "Powering Thunderbolt off…")
+        self.i_toggle.set_sensitive(False)
+        def work():
+            subprocess.run(["sudo", "-n", TB_POWER, "on" if want_on else "off"], capture_output=True, text=True, timeout=60)
+            GLib.idle_add(self._done)
+        threading.Thread(target=work, daemon=True).start()
+
+    def _done(self):
+        self.busy = False; self.i_toggle.set_sensitive(True); self.refresh(); return False
+
+    def refresh(self):
+        if self.busy:
+            return True
+        st = tb_powered(); self.state = st
+        if st is None:
+            self.ind.set_status(AppIndicator.IndicatorStatus.PASSIVE); return True
+        self.ind.set_status(AppIndicator.IndicatorStatus.ACTIVE)
+        self.ind.set_icon_full("thunderbolt-on-symbolic" if st else "thunderbolt-off-symbolic",
+                               "Thunderbolt on" if st else "Thunderbolt off")
+        self.i_toggle.set_label("Power Thunderbolt off" if st else "Power Thunderbolt on")
+        return True
+
 if __name__ == "__main__":
     DgpuTray()
+    BtTray()
+    TbTray()
     Gtk.main()

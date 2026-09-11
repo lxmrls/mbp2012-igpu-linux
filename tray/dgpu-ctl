@@ -1,21 +1,22 @@
 #!/bin/sh
-# Report/control the discrete GPU power. The iGPU always drives the panel;
-# this only powers the dGPU rail on/off (mux stays on Intel). Root-only:
-# reads/writes /sys/kernel/debug/vgaswitcheroo (debugfs is root-readable).
+# Report/control the discrete GPU power. The iGPU always drives the panel.
+# Status comes from the gmux itself (works even after the dGPU's PCI functions have been
+# retired from the bus by gmux-igd-hook); on/off still go through vga_switcheroo when present.
 SW=/sys/kernel/debug/vgaswitcheroo/switch
 DEV=/sys/bus/pci/devices/0000:01:00.0
+GMUXCTL=/usr/local/sbin/gmuxctl
 case "$1" in
   status)
-    if [ -r "$SW" ]; then
-      act=$(grep '+' "$SW" | grep -o 'IGD\|DIS')
-      case "$(grep -E '^[0-9]+:DIS:' "$SW")" in *:Off*) d=off ;; *) d=on ;; esac
-      echo "active=${act:-?} dgpu=$d"
-    else
-      echo "active=? dgpu=?"
-    fi ;;
+    st=$("$GMUXCTL" status 2>/dev/null) || { echo "active=? dgpu=?"; exit 1; }
+    act=$(printf '%s\n' "$st" | sed -n 's/^display=\([A-Z?]*\).*/\1/p')
+    d=$(printf '%s\n' "$st" | sed -n 's/^dgpu_power=\([a-z?]*\).*/\1/p')
+    [ -e "$DEV" ] || pci="retired"
+    echo "active=${act:-?} dgpu=${d:-?}${pci:+ pci=$pci}" ;;
   on)
+    [ -e "$DEV" ] || { echo "refuse: dGPU retired from the PCI bus (boot the External Display entry)"; exit 1; }
     echo ON > "$SW"; echo "dgpu=on" ;;
   off)
+    [ -r "$SW" ] || { echo "dgpu already off/retired"; exit 0; }
     grep -q 'IGD:+' "$SW" || { echo "refuse: iGPU not the active GPU"; exit 1; }
     echo auto > "$DEV/power/control" 2>/dev/null
     echo OFF > "$SW"; echo "dgpu=off" ;;

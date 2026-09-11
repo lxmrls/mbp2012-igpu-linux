@@ -20,6 +20,7 @@ GMUXCTL=/usr/local/sbin/gmuxctl
 LOCK=/run/lock/gmux-igd.lock
 SW=/sys/kernel/debug/vgaswitcheroo/switch
 DGPU=/sys/bus/pci/devices/0000:01:00.0
+DGPU_AUDIO=/sys/bus/pci/devices/0000:01:00.1
 IGPU=/sys/bus/pci/devices/0000:00:02.0
 CMDLINE=" $(cat /proc/cmdline 2>/dev/null) "
 
@@ -37,6 +38,33 @@ try_switch() {
     echo IGD > "$SW" 2>/dev/null
 }
 
+# Once the dGPU is powered off, drop both of its PCI functions from the bus. Otherwise
+# every suspend/resume spends ~8.5 s restoring their config space: each config write to
+# the dead device costs a 48 ms completion timeout, ~175 writes. nouveau's remove on the
+# switched-off GPU is instant (a few benign "timeout" WARNs). The audio function must be
+# driverless: unbinding snd_hda_intel from a dead HDA controller hangs in snd_card_free.
+retire_dgpu() {
+    # plymouth may hold the dGPU's DRM node; let it drop the display while we pull the device
+    ply=0
+    if command -v plymouth >/dev/null 2>&1 && plymouth --ping 2>/dev/null; then plymouth deactivate 2>/dev/null; ply=1; fi
+    _retire_dgpu_devices
+    [ "$ply" = 1 ] && plymouth reactivate 2>/dev/null
+    return 0
+}
+
+_retire_dgpu_devices() {
+    if [ -e "$DGPU_AUDIO" ]; then
+        if [ -e "$DGPU_AUDIO/driver" ]; then
+            log "retire: 01:00.1 still bound to $(basename "$(readlink "$DGPU_AUDIO/driver")"); leaving it (unbind hangs)"
+        else
+            echo 1 > "$DGPU_AUDIO/remove" 2>/dev/null && log "retire: removed dGPU audio function 01:00.1"
+        fi
+    fi
+    if [ -e "$DGPU" ]; then
+        echo 1 > "$DGPU/remove" 2>/dev/null && log "retire: removed dGPU 01:00.0 (nouveau unbound)"
+    fi
+}
+
 switch_if_ready() {
     flip_allowed || return 0
     if has dgpu_keep_on; then log "dgpu_keep_on: leaving dGPU powered"; return 0; fi
@@ -48,12 +76,12 @@ switch_if_ready() {
     while [ ! -e "$SW" ] && [ $i -lt 50 ]; do sleep 0.1; i=$((i+1)); done
     if [ ! -e "$SW" ]; then log "switch: $SW never appeared"; return 0; fi
     if grep -q 'IGD:+' "$SW"; then log "switch: IGD already active"; return 0; fi
-    if try_switch; then log "vga_switcheroo: switched to IGD, dGPU powered off"; return 0; fi
+    if try_switch; then log "vga_switcheroo: switched to IGD, dGPU powered off"; retire_dgpu; return 0; fi
     log "vga_switcheroo: switch to IGD refused (DRM device busy?)"
     # Plymouth may hold a DRM fd; ask it to release the display and retry once.
     if command -v plymouth >/dev/null 2>&1 && plymouth --ping 2>/dev/null; then
         plymouth deactivate 2>/dev/null; sleep 0.3
-        if try_switch; then log "vga_switcheroo: switched to IGD after plymouth deactivate"
+        if try_switch; then log "vga_switcheroo: switched to IGD after plymouth deactivate"; _retire_dgpu_devices
         else log "vga_switcheroo: switch still refused; dGPU stays on"; fi
         plymouth reactivate 2>/dev/null
     fi
@@ -66,6 +94,11 @@ case "$mode" in
         if flip_allowed; then
             if out=$("$GMUXCTL" igd 2>&1); then log "mux -> IGD before i915 probe ($out)"
             else log "gmuxctl igd FAILED: $out"; fi
+            # The dGPU will be powered off and retired: keep snd_hda_intel from ever binding
+            # its HDMI audio function (it loads ~1 s after this hook runs).
+            if ! has dgpu_keep_on && [ -e "$DGPU_AUDIO" ] && [ ! -e "$DGPU_AUDIO/driver" ]; then
+                echo none > "$DGPU_AUDIO/driver_override" 2>/dev/null && log "01:00.1: driver_override=none (dGPU audio stays unbound)"
+            fi
         else
             log "mux flip disabled by kernel cmdline"
         fi
